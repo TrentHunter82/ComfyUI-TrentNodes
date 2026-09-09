@@ -64,3 +64,6 @@ nodes/minimax_h3_cache.py
 
 # Hermes director local state (preflight results, plans)
 .hermes/
+
+# Isolated Eneas runtime and local model configuration
+.eneas/

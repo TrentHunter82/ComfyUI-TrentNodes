@@ -879,3 +879,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 ---
 
 *Made with ❤️ for the ComfyUI community*
+
+### Eneas segmentation
+
+[Eneas Segment & Track](docs/eneas.md) supports text and point-guided tracking, plus category masks, using an isolated Eneas runtime with automatic model downloads. [Example workflow](example_workflows/eneas_segment.json).
