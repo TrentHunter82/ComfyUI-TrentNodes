@@ -286,7 +286,7 @@ When the "background" isn't a single clean layer, ladder through the three modes
 
 <img src="assets/images/nodes/AnimationDuplicateFrameProcessor.png" width="316" alt="Enhanced Animation Timing Processor node">
 
-Analyzes animation sequences to detect duplicate frames and replaces them with gray frames for video generation workflows. Features multiple similarity detection methods (hybrid, SSIM, histogram, perceptual), configurable preservation options for sequence first/last frames, and **keyframe alignment** that automatically inserts padding frames to ensure keyframes land on multiples of 4 (or any configurable multiple) for glitch-free video generation. Outputs include processed frames, duplicate mask, timing report, and removal indices for the companion Frame Remover node.
+Analyzes animation sequences to detect duplicate frames and replaces them with gray frames for video generation workflows. Features multiple similarity detection methods (hybrid, SSIM, histogram, perceptual), configurable preservation options for sequence first/last frames, and **keyframe alignment** that automatically inserts padding frames to ensure keyframes land on multiples of 4 (or any configurable multiple) for glitch-free video generation. Outputs include processed frames, duplicate mask, timing report, and removal indices for the companion Frame Remover node. Enable `pad_to_4n_plus_1` to append gray, masked tail frames up to the next 4n+1 count (WAN/Hunyuan; set `frame_multiple` to 8 for LTX) so no separate frame adjuster is needed; the tail frames are included in `removal_indices`.
 
 **Animation Frame Remover**
 

@@ -129,6 +129,20 @@ class AnimationDuplicateFrameProcessor:
                     "tooltip": "Print detailed analysis of duplicate sequences "
                               "found"
                 }),
+                "pad_to_4n_plus_1": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Append gray frames (mask white) until the batch "
+                              "length is 4n+1, as WAN requires. The appended "
+                              "frames are listed in removal_indices so the "
+                              "Animation Frame Remover strips them again."
+                }),
+                "frame_multiple": ("INT", {
+                    "default": 4,
+                    "min": 1,
+                    "max": 32,
+                    "step": 1,
+                    "tooltip": "The 4 in 4n+1. WAN and Hunyuan use 4, LTX uses 8."
+                }),
             }
         }
 
@@ -241,6 +255,17 @@ class AnimationDuplicateFrameProcessor:
             similarity = min(1.0, similarity + motion_tolerance * 0.5)
 
         return similarity
+
+    @staticmethod
+    def next_valid_frame_count(count, multiple):
+        """Smallest c >= count with c = multiple*n + 1 and n >= 1.
+
+        Matches Wan21FrameAdjusterNode: the minimum is multiple + 1 (5 for
+        WAN), and a count that already fits is returned unchanged.
+        """
+        count = max(count, multiple + 1)
+        remainder = (count - 1) % multiple
+        return count if remainder == 0 else count + (multiple - remainder)
 
     def create_gray_frame(self, original_frame, gray_style, gray_intensity):
         """Create a gray version of the frame based on the selected style."""
@@ -397,17 +422,14 @@ class AnimationDuplicateFrameProcessor:
 
         padded_images = torch.stack(new_frames, dim=0)
 
+        # Padding is inserted right after a run's first frame, so each run
+        # grows by exactly the frames inserted for it.  Do NOT stretch a run
+        # to the next run's start: that absorbs (and grays) the unique
+        # frames sitting between two holds.
         adjusted_sequences = []
-        for seq_idx, (start, length) in enumerate(sequences):
+        for start, length in sequences:
             new_start = old_to_new_mapping[start]
-
-            if seq_idx < len(sequences) - 1:
-                next_seq_start = sequences[seq_idx + 1][0]
-                next_new_start = old_to_new_mapping[next_seq_start]
-                new_length = next_new_start - new_start
-            else:
-                new_length = padded_images.shape[0] - new_start
-
+            new_length = length + insertion_map.get(start, 0)
             adjusted_sequences.append((new_start, new_length))
 
         if debug_info:
@@ -420,11 +442,18 @@ class AnimationDuplicateFrameProcessor:
 
     def align_keyframes_to_multiples(self, images, mask_tensor, preserved_frames,
                                      inserted_indices, alignment_multiple,
-                                     gray_style, gray_intensity, debug_info):
+                                     gray_style, gray_intensity, debug_info,
+                                     gray_source=None):
         """Align keyframes to multiples by inserting gray padding frames.
 
         Follows the same pattern as insert_padding_frames() for consistency.
+
+        ``images`` may already be grayed out; pass the un-grayed batch as
+        ``gray_source`` (same indexing) so the inserted frames are built from
+        original pixels instead of being desaturated/dimmed twice.
         """
+        if gray_source is None:
+            gray_source = images
         if alignment_multiple <= 1:
             return images, mask_tensor, inserted_indices, preserved_frames
 
@@ -504,7 +533,7 @@ class AnimationDuplicateFrameProcessor:
             if original_idx in insertion_map:
                 frames_to_add = insertion_map[original_idx]
                 gray_frame = self.create_gray_frame(
-                    images[original_idx], gray_style, gray_intensity
+                    gray_source[original_idx], gray_style, gray_intensity
                 )
                 gray_mask = torch.ones_like(mask_tensor[original_idx])
 
@@ -551,8 +580,23 @@ class AnimationDuplicateFrameProcessor:
                                  skip_second_to_last, min_sequence_length,
                                  min_gray_frames, insert_padding,
                                  align_keyframes, alignment_multiple,
-                                 debug_info=False):
-        """Main processing function with enhanced duplicate detection."""
+                                 debug_info=False, pad_to_4n_plus_1=False,
+                                 frame_multiple=4):
+        """Main processing function with enhanced duplicate detection.
+
+        Pipeline:
+          1. detect duplicate runs
+          2. insert min_gray_frames padding inside runs that are too short
+          3. classify every frame exactly once: keyframe / gray / untouched
+          4. apply the skip_* options to the keyframe list
+          5. gray out the batch and build the mask from that classification
+          6. align keyframes last, so the index remap covers everything
+          7. optionally append gray frames up to the next 4n+1 count
+
+        Frames that lie outside every duplicate run are left untouched
+        (mask black) but are not keyframes, matching the behaviour the node
+        has always had with padding disabled.
+        """
         if debug_info:
             print(f"Starting enhanced animation timing processing...")
             print(f"Input batch shape: {images.shape}")
@@ -576,85 +620,58 @@ class AnimationDuplicateFrameProcessor:
                 report += f"Frames inserted for padding: {len(inserted_indices)}\n"
                 report += f"New total frame count: {images.shape[0]}\n"
 
-        processed_images = images.clone()
         batch_size, height, width, channels = images.shape
-        mask_tensor = torch.zeros(
-            batch_size, height, width,
-            dtype=images.dtype, device=images.device
-        )
-
-        global_first_idx = 0
-        global_last_idx = batch_size - 1
-
-        preserved_frames = []
         inserted_set = set(inserted_indices)
 
-        for seq_idx, (start_frame, sequence_length) in enumerate(sequences):
-            end_frame = start_frame + sequence_length
-            last_frame = end_frame - 1
+        # ---- Step 3: classify every frame exactly once --------------------
+        # keyframes -> kept as-is, mask black.  gray -> replaced, mask white.
+        # Anything in neither set is outside every run: untouched, mask black.
+        keyframes = set()
+        gray = set(inserted_set)
 
-            for frame_idx in range(start_frame, end_frame):
-                is_inserted = frame_idx in inserted_set
+        for start_frame, sequence_length in sequences:
+            last_frame = start_frame + sequence_length - 1
+            for frame_idx in range(start_frame, last_frame + 1):
+                if frame_idx in inserted_set:
+                    continue
+                if ((preserve_first and frame_idx == start_frame) or
+                        (preserve_last and frame_idx == last_frame)):
+                    keyframes.add(frame_idx)
+                else:
+                    gray.add(frame_idx)
 
-                if not is_inserted:
-                    should_preserve = False
+        # Global first/last are batch-level rules. They must apply whether or
+        # not the frame happens to sit inside a duplicate run.  Padding is only
+        # ever inserted *after* a frame, so index 0 is always an original
+        # frame, but trailing padding can follow the last original frame.
+        original_indices = [i for i in range(batch_size) if i not in inserted_set]
+        global_first_idx = original_indices[0]
+        global_last_idx = original_indices[-1]
 
-                    if preserve_first and frame_idx == start_frame:
-                        should_preserve = True
-                    elif preserve_last and frame_idx == last_frame:
-                        should_preserve = True
-                    elif preserve_global_first and frame_idx == global_first_idx:
-                        should_preserve = True
-                    elif preserve_global_last and frame_idx == global_last_idx:
-                        should_preserve = True
+        if preserve_global_first:
+            keyframes.add(global_first_idx)
+            gray.discard(global_first_idx)
+        if preserve_global_last:
+            keyframes.add(global_last_idx)
+            gray.discard(global_last_idx)
 
-                    if should_preserve and frame_idx not in preserved_frames:
-                        preserved_frames.append(frame_idx)
+        preserved_frames = sorted(keyframes)
+        preserved_before_skip = len(preserved_frames)
 
-        preserved_frames.sort()
-
-        # Keyframe alignment step - insert frames to align keyframes to multiples
-        if align_keyframes and alignment_multiple > 1:
-            (images, mask_tensor, inserted_indices, preserved_frames) = \
-                self.align_keyframes_to_multiples(
-                    images, mask_tensor, preserved_frames, inserted_indices,
-                    alignment_multiple, gray_style, gray_intensity, debug_info
-                )
-            # Update batch size and derived variables
-            batch_size = images.shape[0]
-            processed_images = images.clone()
-            inserted_set = set(inserted_indices)
-            # Extend last sequence to cover the new batch size
-            if sequences:
-                last_start, _ = sequences[-1]
-                sequences[-1] = (last_start, batch_size - last_start)
-            # Update global last index
-            global_last_idx = batch_size - 1
-
-            # Always report alignment info when alignment is enabled
-            report += f"\nKeyframe Alignment:\n"
-            report += f"Alignment multiple: {alignment_multiple}\n"
-            report += f"Aligned keyframe positions: {preserved_frames}\n"
-            report += f"New total frame count after alignment: {batch_size}\n"
-
+        # ---- Step 4: skip options operate on the ordered keyframe list ----
         frames_to_skip = set()
         if skip_second and len(preserved_frames) >= 2:
-            skip_idx = preserved_frames[1]
-            frames_to_skip.add(skip_idx)
-            if debug_info:
-                print(f"Skipping 2nd preserved frame: {skip_idx}")
-
+            frames_to_skip.add(preserved_frames[1])
         if skip_second_to_last and len(preserved_frames) >= 2:
-            skip_idx = preserved_frames[-2]
-            frames_to_skip.add(skip_idx)
-            if debug_info:
-                print(f"Skipping 2nd-to-last preserved frame: {skip_idx}")
+            frames_to_skip.add(preserved_frames[-2])
+
+        for frame_idx in frames_to_skip:
+            keyframes.discard(frame_idx)
+            gray.add(frame_idx)
+        preserved_frames = sorted(keyframes)
 
         if debug_info:
-            print(f"\nPreserved frames list: {preserved_frames}")
-            print(f"Frames to skip from preserved list: {frames_to_skip}")
-            print(f"\nProcessing {len(sequences)} sequences...")
-            print(f"Preserve first frame of sequences: {preserve_first}")
+            print(f"\nPreserve first frame of sequences: {preserve_first}")
             print(f"Preserve last frame of sequences: {preserve_last}")
             print(f"Preserve global first frame (idx {global_first_idx}): "
                   f"{preserve_global_first}")
@@ -662,59 +679,104 @@ class AnimationDuplicateFrameProcessor:
                   f"{preserve_global_last}")
             print(f"Skip 2nd preserved frame: {skip_second}")
             print(f"Skip 2nd-to-last preserved frame: {skip_second_to_last}")
+            print(f"Frames skipped from preserved list: {sorted(frames_to_skip)}")
+            print(f"Keyframes before alignment: {preserved_frames}")
 
-        frames_processed = 0
+        # ---- Step 5: gray-out pass driven by the classification -----------
+        processed_images = images.clone()
+        mask_tensor = torch.zeros(
+            batch_size, height, width,
+            dtype=images.dtype, device=images.device
+        )
 
-        for seq_idx, (start_frame, sequence_length) in enumerate(sequences):
-            end_frame = start_frame + sequence_length
-            last_frame = end_frame - 1
+        for frame_idx in sorted(gray):
+            if frame_idx not in inserted_set:
+                processed_images[frame_idx] = self.create_gray_frame(
+                    images[frame_idx], gray_style, gray_intensity
+                )
+            mask_tensor[frame_idx] = 1.0
+
+        if debug_info:
+            print(f"\nProcessing {batch_size} frames "
+                  f"({len(sequences)} duplicate sequences)...")
+            for frame_idx in range(batch_size):
+                if frame_idx in keyframes:
+                    print(f"  Frame {frame_idx}: PRESERVED - mask BLACK")
+                elif frame_idx in frames_to_skip:
+                    print(f"  Frame {frame_idx}: SKIPPED (was preserved) "
+                          "- mask WHITE")
+                elif frame_idx in inserted_set:
+                    print(f"  Frame {frame_idx}: GRAY (inserted padding) "
+                          "- mask WHITE")
+                elif frame_idx in gray:
+                    print(f"  Frame {frame_idx}: GRAY (replaced) - mask WHITE")
+                else:
+                    print(f"  Frame {frame_idx}: UNTOUCHED (outside runs) "
+                          "- mask BLACK")
+
+        # ---- Step 6: keyframe alignment runs last ------------------------
+        # It inserts permanent gray frames and remaps the keyframe list, the
+        # removable padding indices and the mask in one pass, so nothing
+        # downstream can hold stale indices.
+        if align_keyframes and alignment_multiple > 1:
+            (processed_images, mask_tensor, inserted_indices,
+             preserved_frames) = self.align_keyframes_to_multiples(
+                processed_images, mask_tensor, preserved_frames,
+                inserted_indices, alignment_multiple, gray_style,
+                gray_intensity, debug_info, gray_source=images
+            )
+            batch_size = processed_images.shape[0]
+
+            # Always report alignment info when alignment is enabled
+            report += f"\nKeyframe Alignment:\n"
+            report += f"Alignment multiple: {alignment_multiple}\n"
+            report += f"Aligned keyframe positions: {preserved_frames}\n"
+            report += f"New total frame count after alignment: {batch_size}\n"
+
+        # ---- Step 7: pad to multiple*n + 1 frames (WAN needs 4n+1) --------
+        # Appended frames are gray, mask white, and go into removal_indices so
+        # the Frame Remover restores the original count afterwards.
+        appended_indices = []
+        if pad_to_4n_plus_1:
+            target_count = self.next_valid_frame_count(batch_size, frame_multiple)
+            frames_to_add = target_count - batch_size
+            if frames_to_add > 0:
+                tail_frame = self.create_gray_frame(
+                    images[global_last_idx], gray_style, gray_intensity
+                )
+                tail_frames = tail_frame.unsqueeze(0).repeat(
+                    frames_to_add, 1, 1, 1
+                )
+                tail_mask = torch.ones(
+                    frames_to_add, height, width,
+                    dtype=mask_tensor.dtype, device=mask_tensor.device
+                )
+                processed_images = torch.cat([processed_images, tail_frames], dim=0)
+                mask_tensor = torch.cat([mask_tensor, tail_mask], dim=0)
+                appended_indices = list(range(batch_size, target_count))
+                inserted_indices = sorted(inserted_indices) + appended_indices
+                batch_size = target_count
 
             if debug_info:
-                print(f"Processing sequence {seq_idx + 1}: "
-                      f"frames {start_frame}-{last_frame}")
+                print(f"\n=== {frame_multiple}n+1 Frame Padding ===")
+                print(f"Appended {frames_to_add} gray frames -> "
+                      f"{batch_size} frames total")
 
-            for frame_idx in range(start_frame, end_frame):
-                is_inserted = frame_idx in inserted_set
-                should_be_gray = True
+            report += f"\n{frame_multiple}n+1 Frame Padding:\n"
+            report += f"Frames appended: {frames_to_add}\n"
+            report += f"Final frame count: {batch_size}\n"
 
-                if (frame_idx in preserved_frames and
-                        frame_idx not in frames_to_skip):
-                    should_be_gray = False
-                    if debug_info:
-                        print(f"  Frame {frame_idx}: PRESERVED - mask BLACK")
-                elif frame_idx in frames_to_skip:
-                    should_be_gray = True
-                    if debug_info:
-                        print(f"  Frame {frame_idx}: SKIPPED (was preserved) "
-                              "- mask WHITE")
-
-                if should_be_gray:
-                    if not is_inserted:
-                        gray_frame = self.create_gray_frame(
-                            images[frame_idx], gray_style, gray_intensity
-                        )
-                        processed_images[frame_idx] = gray_frame
-
-                    mask_tensor[frame_idx] = 1.0
-                    frames_processed += 1
-
-                    if debug_info:
-                        if is_inserted:
-                            print(f"  Frame {frame_idx}: GRAY (inserted padding)"
-                                  " - mask WHITE")
-                        else:
-                            print(f"  Frame {frame_idx}: GRAY (replaced) "
-                                  "- mask WHITE")
+        frame_is_gray = mask_tensor.reshape(batch_size, -1).amax(dim=1) > 0.5
+        frames_processed = int(frame_is_gray.sum().item())
 
         if debug_info:
             print(f"\nMask Summary:")
             print(f"Total gray frames (white in mask): {frames_processed}")
             print(f"Total preserved frames (black in mask): "
                   f"{batch_size - frames_processed}")
+            print(f"Final keyframe positions: {preserved_frames}")
 
         removal_indices_str = ",".join(map(str, sorted(inserted_indices)))
-        if not removal_indices_str:
-            removal_indices_str = ""
 
         report += f"\nProcessing results:\n"
         report += f"Frames replaced with gray: {frames_processed}\n"
@@ -725,7 +787,7 @@ class AnimationDuplicateFrameProcessor:
         report += f"Preserve last frame of sequences: {preserve_last}\n"
         report += f"Preserve global first frame: {preserve_global_first}\n"
         report += f"Preserve global last frame: {preserve_global_last}\n"
-        report += f"Total preserved frames before skip: {len(preserved_frames)}\n"
+        report += f"Total preserved frames before skip: {preserved_before_skip}\n"
         report += f"Skip 2nd preserved frame: {skip_second}\n"
         report += f"Skip 2nd-to-last preserved frame: {skip_second_to_last}\n"
         if frames_to_skip:
@@ -734,12 +796,15 @@ class AnimationDuplicateFrameProcessor:
         report += f"Keyframe alignment enabled: {align_keyframes}\n"
         if align_keyframes:
             report += f"Alignment multiple: {alignment_multiple}\n"
-            report += f"Final keyframe positions: {sorted(preserved_frames)}\n"
+        report += f"Final keyframe positions: {preserved_frames}\n"
 
         if inserted_indices:
             report += f"\nRemoval Information:\n"
             report += f"Frames to remove after processing: {removal_indices_str}\n"
             report += f"(These are the padded frames that should be removed)\n"
+            if appended_indices:
+                report += (f"Of these, {len(appended_indices)} are the "
+                           f"{frame_multiple}n+1 tail frames\n")
 
         return (processed_images, mask_tensor, report, removal_indices_str)
 
